@@ -23,6 +23,20 @@ static ngx_str_t  ngx_http_minify_default_types[] = {
     ngx_null_string
 };
 
+typedef enum {
+    copy_b_to_a = 1,
+    copy_b_to_a_delete_a,
+    delete_b
+} ngx_http_minify_state_e;
+
+typedef struct {
+    u_char a;
+    u_char b;
+    u_char look_ahead;
+    u_char x;
+    u_char y;
+} ngx_http_minify_ctx_t;
+
 
 static ngx_command_t  ngx_http_minify_filter_commands[] = {
 
@@ -91,6 +105,7 @@ static ngx_int_t ngx_http_minify_buf(ngx_buf_t *buf,ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_minify_header_filter(ngx_http_request_t *r)
 {
+    ngx_http_minify_ctx     *ctx;
     ngx_http_minify_conf_t  *conf;
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_minify_filter_module);
@@ -106,6 +121,19 @@ ngx_http_minify_header_filter(ngx_http_request_t *r)
     {
         return ngx_http_next_header_filter(r);
     }
+
+    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_minify_ctx_t));
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    ctx->look_ahead = EOF;
+    ctx->x = EOF; 
+    ctx->y = EOF;
+
+    ngx_http_set_ctx(r, ctx, ngx_http_minify_filter_module);
+    //TODO:should open this?
+    //r->main_filter_need_in_memory = 1;
 
     ngx_http_clear_content_length(r);
     return ngx_http_next_header_filter(r);
@@ -215,6 +243,275 @@ ngx_http_minify_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     return ngx_http_next_body_filter(r,in);
 
+}
+
+static u_char ngx_http_minify_get_converted_char(u_char c){
+    if (c >= ' ' || c == '\n' || c == EOF) {
+        return c;
+    }
+    if (c == '\r') {
+        return '\n';
+    }
+    return ' ';
+
+}
+
+static void ngx_http_minify_putc_to_output(u_char c,ngx_buf_t *out)
+{
+    if(out->pos <= out->end) {
+        out->pos[0] = c;
+        ++out->pos;
+    }
+}
+
+static u_char ngx_http_minify_get(ngx_buf_t *in,ngx_http_minify_ctx_t *ctx)
+{
+
+    if (in->pos > in->end) {
+        return EOF;
+    }
+
+    u_char c = in->pos[0];
+
+    if(in->pos < in->last){
+       ctx->look_ahead = *in->pos + 1;
+    }
+
+    ++in->pos;
+    return ngx_http_minify_get_converted_char(c);
+
+}
+
+static int next(ngx_buf_t *in)
+{
+    int c = get(in);
+    if  (c == '/') {
+        switch (peek(in)) {
+
+        case '/':
+            for (;;) {
+                c = get(in);
+                if (c <= '\n') {
+                    break;
+                }
+            }
+            break;
+
+        case '*':
+            get(in);
+            while (c != ' ') {
+                switch (get(in)) {
+
+                case '*':
+                    if (peek(in) == '/') {
+                        get(in);
+                        c = ' ';
+                    }
+                    break;
+
+                case EOF:
+                    break; /* Unterminated comment. */
+                }
+            }
+
+            break;
+        }
+    }
+
+    theY = theX;
+    theX = c;
+
+    return c;
+}
+
+
+static void ngx_http_minify_do_action(u_char d,ngx_buf_t *in,ngx_buf_t *out,ngx_http_minify_ctx_t *ctx)
+{
+    switch (d) {
+
+    case copy_b_to_a:
+        ngx_http_minify_putc_to_output(ctx->a, out);
+        if ((ctx->y == '\n' || ctx->y == ' ') 
+            && (ctx->a == '+' || ctx->a == '-' || ctx->a == '*' || ctx->a == '/') 
+            && (ctx->b == '+' || ctx->b == '-' || ctx->b == '*' || ctx->b == '/'))
+        {
+            ngx_http_minify_putc_to_output(ctx->y, out);
+        }
+
+    case copy_b_to_a_delete_a:
+        ctx->a = ctx->b;
+        if (ctx->a == '\'' || ctx->a == '"' || ctx->a == '`') {
+            for (;;) {
+                ngx_http_minify_putc_to_output(ctx->a, out);
+                ctx->a = ngx_http_minify_get(in,ctx);
+                if (ctx->a == ctx->b) {
+                    break;
+                }
+                if (ctx->a == '\\') {
+                    ngx_http_minify_putc_to_output(ctx->a, out);
+                    ctx->a = ngx_http_minify_get(in,ctx);
+                }
+                if (ctx->a == EOF) {
+                    break; /* Unterminated string literal. */
+                }
+            }
+        }
+
+    case delete_b:
+        ctx->b = next(in);
+        if (ctx->b == '/' && (
+            ctx->a == '(' || ctx->a == ',' || ctx->a == '=' || ctx->a == ':' 
+            || ctx->a == '[' || ctx->a == '!' || ctx->a == '&' || ctx->a == '|' 
+            || ctx->a == '?' || ctx->a == '+' || ctx->a == '-' || ctx->a == '~' 
+            || ctx->a == '*' || ctx->a == '/' || ctx->a == '\n'))
+        {
+            ngx_http_minify_putc_to_output(ctx->a, out);
+            if (ctx->a == '/' || ctx->a == '*') {
+                ngx_http_minify_putc_to_output(' ', out);
+            }
+
+            ngx_http_minify_putc_to_output(ctx->b, out);
+
+            for (;;) {
+                ctx->a = ngx_http_minify_get(in,ctx);
+                if (ctx->a == '[') {
+                    for (;;) {
+                        ngx_http_minify_putc_to_output(ctx->a, out);
+                        ctx->a = ngx_http_minify_get(in,ctx);
+                        if (ctx->a == ']') {
+                            break;
+                        }
+                        if (ctx->a == '\\') {
+                            ngx_http_minify_putc_to_output(ctx->a, out);
+                            ctx->a = ngx_http_minify_get(in,ctx);
+                        }
+                        if (ctx->a == EOF) {
+                            break; /* Unterminated set in Regular Expression literal.*/
+                        }
+                    }
+
+                } else if (ctx->a == '/') {
+                    switch (ctx->look_ahead) {
+                    case '/':
+                    case '*':
+                         break; /* Unterminated set in Regular Expression literal.*/
+                    }
+
+                    break;
+
+                } else if (ctx->a =='\\') {
+                    ngx_http_minify_putc_to_output(ctx->a, out);
+                    ctx->a = ngx_http_minify_get(in,ctx);
+                }
+                if (ctx->a == EOF) {
+                    break; /* Unterminated Regular Expression literal.*/
+                }
+
+                ngx_http_minify_putc_to_output(ctx->a, out);
+            }
+
+            ctx->b = next(in);
+        }
+    }
+}
+
+
+static void ngx_http_minify_jsmin(ngx_buf_t *in,ngx_buf_t *out, ngx_http_minify_ctx_t *ctx)
+{
+   
+    u_char  *read, *write, ch, look;
+
+    if(in->pos <= in->last){
+        ctx->look_ahead = *in->pos;
+    } else {
+        return;
+    }
+    
+    ctx->a = '\n';
+
+    for (read = in->pos; read < in->last; ++read){
+        ch = *read;
+        if(in->pos < in->last){
+            ctx->look_ahead = *in->pos + 1;
+        }
+        
+        if (ch == 0xEF){
+            continue;
+        }
+        ch = ngx_http_minify_get_converted_char(ch);
+
+        
+
+    } 
+     
+
+    theA = '\n';
+    action(3,in,out);
+    while (theA != EOF) {
+        switch (theA) {
+
+        case ' ':
+            action(isAlphanum(theB) ? 1 : 2,in,out);
+            break;
+
+        case '\n':
+            switch (theB) {
+
+            case '{':
+            case '[':
+            case '(':
+            case '+':
+            case '-':
+            case '!':
+            case '~':
+                action(1,in,out);
+                break;
+
+            case ' ':
+                action(3,in,out);
+                break;
+
+            default:
+                action(isAlphanum(theB) ? 1 : 2,in,out);
+            }
+            break;
+
+        default:
+            switch (theB) {
+
+            case ' ':
+                action(isAlphanum(theA) ? 1 : 3,in,out);
+                break;
+
+            case '\n':
+                switch (theA) {
+
+                case '}':
+                case ']':
+                case ')':
+                case '+':
+                case '-':
+                case '"':
+                case '\'':
+                case '`':
+                    action(1,in,out);
+                    break;
+
+                default:
+                    action(isAlphanum(theA) ? 1 : 3,in,out);
+                }
+                break;
+
+            default:
+                action(1,in,out);
+                break;
+            }
+        }
+    }
+
+    out->end = out->pos;
+    out->last = out->pos;
+    out->pos = out->start;
 }
 
 static ngx_int_t 
