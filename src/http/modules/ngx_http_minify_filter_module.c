@@ -282,15 +282,15 @@ static u_char ngx_http_minify_get(ngx_buf_t *in,ngx_http_minify_ctx_t *ctx)
 
 }
 
-static int next(ngx_buf_t *in)
+static u_char ngx_http_minify_next(ngx_buf_t *in, ngx_http_minify_ctx_t *ctx)
 {
-    int c = get(in);
+    u_char c = ngx_http_minify_get(in, ctx);
     if  (c == '/') {
         switch (peek(in)) {
 
         case '/':
             for (;;) {
-                c = get(in);
+                c = ngx_http_minify_get(in, ctx);
                 if (c <= '\n') {
                     break;
                 }
@@ -298,13 +298,13 @@ static int next(ngx_buf_t *in)
             break;
 
         case '*':
-            get(in);
+            ngx_http_minify_get(in, ctx);
             while (c != ' ') {
-                switch (get(in)) {
+                switch (ngx_http_minify_get(in, ctx)) {
 
                 case '*':
                     if (peek(in) == '/') {
-                        get(in);
+                        ngx_http_minify_get(in, ctx);
                         c = ' ';
                     }
                     break;
@@ -318,8 +318,8 @@ static int next(ngx_buf_t *in)
         }
     }
 
-    theY = theX;
-    theX = c;
+    ctx->y = ctx->x;
+    ctx->x = c;
 
     return c;
 }
