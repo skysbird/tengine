@@ -105,7 +105,7 @@ static ngx_int_t ngx_http_minify_buf(ngx_buf_t *buf,ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_minify_header_filter(ngx_http_request_t *r)
 {
-    ngx_http_minify_ctx     *ctx;
+    ngx_http_minify_ctx_t   *ctx;
     ngx_http_minify_conf_t  *conf;
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_minify_filter_module);
@@ -246,9 +246,10 @@ ngx_http_minify_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 }
 
 static u_char ngx_http_minify_get_converted_char(u_char c){
-    if (c >= ' ' || c == '\n' || c == EOF) {
+    if (c >= ' ' || c == '\n' ) {
         return c;
     }
+
     if (c == '\r') {
         return '\n';
     }
@@ -286,7 +287,7 @@ static u_char ngx_http_minify_next(ngx_buf_t *in, ngx_http_minify_ctx_t *ctx)
 {
     u_char c = ngx_http_minify_get(in, ctx);
     if  (c == '/') {
-        switch (peek(in)) {
+        switch (ctx->look_ahead) {
 
         case '/':
             for (;;) {
@@ -303,14 +304,12 @@ static u_char ngx_http_minify_next(ngx_buf_t *in, ngx_http_minify_ctx_t *ctx)
                 switch (ngx_http_minify_get(in, ctx)) {
 
                 case '*':
-                    if (peek(in) == '/') {
+                    if (ctx->look_ahead == '/') {
                         ngx_http_minify_get(in, ctx);
                         c = ' ';
                     }
                     break;
 
-                case EOF:
-                    break; /* Unterminated comment. */
                 }
             }
 
@@ -351,14 +350,11 @@ static void ngx_http_minify_do_action(u_char d,ngx_buf_t *in,ngx_buf_t *out,ngx_
                     ngx_http_minify_putc_to_output(ctx->a, out);
                     ctx->a = ngx_http_minify_get(in,ctx);
                 }
-                if (ctx->a == EOF) {
-                    break; /* Unterminated string literal. */
-                }
             }
         }
 
     case delete_b:
-        ctx->b = next(in);
+        ctx->b = ngx_http_minify_next(in, ctx);
         if (ctx->b == '/' && (
             ctx->a == '(' || ctx->a == ',' || ctx->a == '=' || ctx->a == ':' 
             || ctx->a == '[' || ctx->a == '!' || ctx->a == '&' || ctx->a == '|' 
@@ -385,9 +381,6 @@ static void ngx_http_minify_do_action(u_char d,ngx_buf_t *in,ngx_buf_t *out,ngx_
                             ngx_http_minify_putc_to_output(ctx->a, out);
                             ctx->a = ngx_http_minify_get(in,ctx);
                         }
-                        if (ctx->a == EOF) {
-                            break; /* Unterminated set in Regular Expression literal.*/
-                        }
                     }
 
                 } else if (ctx->a == '/') {
@@ -403,23 +396,26 @@ static void ngx_http_minify_do_action(u_char d,ngx_buf_t *in,ngx_buf_t *out,ngx_
                     ngx_http_minify_putc_to_output(ctx->a, out);
                     ctx->a = ngx_http_minify_get(in,ctx);
                 }
-                if (ctx->a == EOF) {
-                    break; /* Unterminated Regular Expression literal.*/
-                }
 
                 ngx_http_minify_putc_to_output(ctx->a, out);
             }
 
-            ctx->b = next(in);
+            ctx->b = ngx_http_minify_next(in, ctx);
         }
     }
 }
 
+static int isAlphanum(int c)
+{
+    return ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') 
+            || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' || c == '\\' 
+            || c > 126);
+}
 
 static void ngx_http_minify_jsmin(ngx_buf_t *in,ngx_buf_t *out, ngx_http_minify_ctx_t *ctx)
 {
    
-    u_char  *read, *write, ch, look;
+    u_char  *read, ch;
 
     if(in->pos <= in->last){
         ctx->look_ahead = *in->pos;
@@ -428,6 +424,7 @@ static void ngx_http_minify_jsmin(ngx_buf_t *in,ngx_buf_t *out, ngx_http_minify_
     }
     
     ctx->a = '\n';
+
 
     for (read = in->pos; read < in->last; ++read){
         ch = *read;
@@ -438,25 +435,18 @@ static void ngx_http_minify_jsmin(ngx_buf_t *in,ngx_buf_t *out, ngx_http_minify_
         if (ch == 0xEF){
             continue;
         }
-        ch = ngx_http_minify_get_converted_char(ch);
 
+        ngx_http_minify_do_action(delete_b, in, out, ctx);
+
+
+        switch (ctx->a) {
         
-
-    } 
-     
-
-    theA = '\n';
-    action(3,in,out);
-    while (theA != EOF) {
-        switch (theA) {
-
         case ' ':
-            action(isAlphanum(theB) ? 1 : 2,in,out);
+            ngx_http_minify_do_action( isAlphanum(ctx->b) ? copy_b_to_a:copy_b_to_a_delete_a , in, out, ctx);
             break;
 
         case '\n':
-            switch (theB) {
-
+            switch (ctx->b) {
             case '{':
             case '[':
             case '(':
@@ -464,27 +454,27 @@ static void ngx_http_minify_jsmin(ngx_buf_t *in,ngx_buf_t *out, ngx_http_minify_
             case '-':
             case '!':
             case '~':
-                action(1,in,out);
+                ngx_http_minify_do_action(copy_b_to_a,in,out,ctx);
                 break;
 
             case ' ':
-                action(3,in,out);
+                ngx_http_minify_do_action(delete_b,in,out,ctx);
                 break;
 
             default:
-                action(isAlphanum(theB) ? 1 : 2,in,out);
+                ngx_http_minify_do_action(isAlphanum(ctx->b)?copy_b_to_a:copy_b_to_a_delete_a,in,out,ctx);
             }
             break;
 
         default:
-            switch (theB) {
+            switch (ctx->b) {
 
             case ' ':
-                action(isAlphanum(theA) ? 1 : 3,in,out);
+                ngx_http_minify_do_action(isAlphanum(ctx->a) ? copy_b_to_a : delete_b,in,out,ctx);
                 break;
 
             case '\n':
-                switch (theA) {
+                switch (ctx->a) {
 
                 case '}':
                 case ']':
@@ -494,20 +484,21 @@ static void ngx_http_minify_jsmin(ngx_buf_t *in,ngx_buf_t *out, ngx_http_minify_
                 case '"':
                 case '\'':
                 case '`':
-                    action(1,in,out);
+                    ngx_http_minify_do_action(copy_b_to_a,in,out,ctx);
                     break;
 
                 default:
-                    action(isAlphanum(theA) ? 1 : 3,in,out);
+                    ngx_http_minify_do_action(isAlphanum(ctx->a) ? copy_b_to_a : delete_b,in,out,ctx);
+
                 }
                 break;
 
             default:
-                action(1,in,out);
+                ngx_http_minify_do_action(copy_b_to_a ,in,out,ctx);
                 break;
             }
         }
-    }
+     }
 
     out->end = out->pos;
     out->last = out->pos;
@@ -517,7 +508,9 @@ static void ngx_http_minify_jsmin(ngx_buf_t *in,ngx_buf_t *out, ngx_http_minify_
 static ngx_int_t 
 ngx_http_minify_buf_in_memory(ngx_buf_t *buf,ngx_http_request_t *r)
 {
-    ngx_buf_t   *b = NULL, *dst = NULL, *min_dst = NULL;
+    ngx_buf_t             *b = NULL, *dst = NULL, *min_dst = NULL;
+    ngx_http_minify_ctx_t *ctx;
+
     ngx_int_t size;
 
     size = buf->end - buf->start;
@@ -535,13 +528,15 @@ ngx_http_minify_buf_in_memory(ngx_buf_t *buf,ngx_http_request_t *r)
     b->last = b->start;
     b->end = b->last + size;
     b->temporary = 1;
-    
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_minify_filter_module);
+   
     min_dst = b;
     if (ngx_strcmp(r->headers_out.content_type.data,
                    ngx_http_minify_default_types[0].data) 
         == 0)
     {
-        jsmin(dst,min_dst);
+        ngx_http_minify_jsmin(dst,min_dst,ctx);
 
     } else if (ngx_strcmp(r->headers_out.content_type.data, 
                           ngx_http_minify_default_types[1].data) 
